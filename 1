@@ -1,0 +1,286 @@
+import os
+import shutil
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score, cohen_kappa_score
+import seaborn as sns
+
+# =========================
+# 1) CONFIGURARE
+# =========================
+TRAIN_CSV_PATH = r"...\train.csv"
+TRAIN_IMG_DIR  = r"..."
+
+DATA_DIR = r"aptos_dataset"   # va conține train/val/test cu subfoldere 0..4
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 16
+EPOCHS = 30
+SEED = 123
+
+BUILD_DATASET_FOLDERS = True  # rulează o dată, apoi poate rămâne True (va detecta dacă e populat)
+
+# =========================
+# 2) GPU (opțional)
+# =========================
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
+
+# =========================
+# 3) BUILD FOLDERE (train/val/test + clase 0..4)
+# =========================
+def ensure_dirs():
+    for split in ["train", "val", "test"]:
+        for c in range(5):
+            os.makedirs(os.path.join(DATA_DIR, split, str(c)), exist_ok=True)
+
+def build_folders_from_csv():
+    print("🔄 Construiesc structura dataset-ului APTOS în foldere...")
+
+    df = pd.read_csv(TRAIN_CSV_PATH)
+    df["path"] = df["id_code"].apply(lambda x: os.path.join(TRAIN_IMG_DIR, f"{x}.png"))
+    df["diagnosis"] = df["diagnosis"].astype(int)
+
+    train_df, temp_df = train_test_split(
+        df, test_size=0.2, random_state=SEED, stratify=df["diagnosis"]
+    )
+    val_df, test_df = train_test_split(
+        temp_df, test_size=0.5, random_state=SEED, stratify=temp_df["diagnosis"]
+    )
+
+    ensure_dirs()
+
+    def copy_split(split_df, split_name):
+        missing = 0
+        for _, row in split_df.iterrows():
+            src = row["path"]
+            label = str(int(row["diagnosis"]))
+            if not os.path.exists(src):
+                missing += 1
+                continue
+            dst = os.path.join(DATA_DIR, split_name, label, os.path.basename(src))
+            if not os.path.exists(dst):
+                shutil.copy2(src, dst)
+        if missing:
+            print(f" Lipsă {missing} imagini la split={split_name}")
+
+    copy_split(train_df, "train")
+    copy_split(val_df, "val")
+    copy_split(test_df, "test")
+
+    print(" Dataset folderizat în:", os.path.abspath(DATA_DIR))
+    print("   train:", len(train_df), "val:", len(val_df), "test:", len(test_df))
+
+if BUILD_DATASET_FOLDERS:
+    ensure_dirs()
+    # verificăm dacă train are fișiere
+    any_file = False
+    for root, _, files in os.walk(os.path.join(DATA_DIR, "train")):
+        if files:
+            any_file = True
+            break
+
+    if not any_file:
+        build_folders_from_csv()
+    else:
+        print(" DATA_DIR este deja populat. Sar peste reconstruire.")
+
+# =========================
+# 4) ÎNCĂRCARE DATE (ca la RSNA)
+# =========================
+print(f" Se încarcă datele din: {DATA_DIR}")
+
+train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(DATA_DIR, "train"),
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='int',
+    shuffle=True
+)
+
+val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(DATA_DIR, "val"),
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode='int',
+    shuffle=False
+)
+
+test_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(DATA_DIR, "test"),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    seed=SEED,
+    label_mode='int',
+    shuffle=False
+)
+
+class_names = train_ds.class_names
+print("Clase detectate:", class_names)
+
+# =========================
+# 5) CLASS WEIGHTS (ca la RSNA)
+# =========================
+print("⚖️ Se calculează ponderile claselor...")
+y_train_all = []
+for _, labels in train_ds.unbatch():
+    y_train_all.append(int(labels.numpy()))
+y_train_all = np.array(y_train_all)
+
+weights = class_weight.compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_train_all),
+    y=y_train_all
+)
+class_weights = {int(i): float(w) for i, w in zip(np.unique(y_train_all), weights)}
+print(f" Ponderi aplicate: {class_weights}")
+
+# =========================
+# 6) PREFETCH
+# =========================
+AUTOTUNE = tf.data.AUTOTUNE
+train_ds = train_ds.shuffle(1000).prefetch(AUTOTUNE)
+val_ds = val_ds.prefetch(AUTOTUNE)
+test_ds = test_ds.prefetch(AUTOTUNE)
+
+# =========================
+# 7) AUGMENTARE + RESCALING (ca la RSNA)
+# =========================
+data_augmentation = keras.Sequential([
+    layers.Rescaling(1./255),
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.05),
+    layers.RandomZoom(0.1),
+])
+
+# =========================
+# 8) MODEL (DenseNet121 - merge la tine)
+# =========================
+base_model = keras.applications.DenseNet121(
+    weights="imagenet",
+    include_top=False,
+    input_shape=IMG_SIZE + (3,)
+)
+base_model.trainable = False
+
+inputs = keras.Input(shape=IMG_SIZE + (3,))
+x = data_augmentation(inputs)
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(0.4)(x)
+outputs = layers.Dense(5, activation="softmax")(x)
+
+model = keras.Model(inputs, outputs)
+
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+# =========================
+# 9) CALLBACKS
+# =========================
+early_stop = keras.callbacks.EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    restore_best_weights=True
+)
+
+# =========================
+# 10) TRAIN
+# =========================
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    class_weight=class_weights,
+    callbacks=[early_stop]
+)
+
+# =========================
+# 11) PLOT (ca la RSNA)
+# =========================
+acc = history.history['accuracy']
+val_acc = history.history['val_accuracy']
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+epochs_range = range(1, len(acc) + 1)
+
+plt.figure(figsize=(14, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, acc, label='Train Acc', color='red')
+plt.plot(epochs_range, val_acc, label='Val Acc', color='blue')
+plt.legend(loc='lower right')
+plt.title('Accuracy')
+plt.xlabel('Epoci')
+plt.ylabel('Score (0-1)')
+plt.grid(True)
+plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+plt.ylim(0, 1)
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, loss, label='Train Loss', color='red')
+plt.plot(epochs_range, val_loss, label='Val Loss', color='blue')
+plt.legend(loc='upper right')
+plt.title('Loss')
+plt.xlabel('Epoci')
+plt.ylabel('Valoare Loss')
+plt.grid(True)
+plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+
+plt.tight_layout()
+plt.show()
+
+# =========================
+# 12) TEST: Balanced Acc + QWK + Confusion Matrix
+# =========================
+print("\nGenerare predicții pe Test...")
+y_true = []
+y_pred_probs = []
+
+for images, labels in test_ds:
+    preds = model.predict(images, verbose=0)  # (batch, 5)
+    y_pred_probs.extend(preds)
+    y_true.extend(labels.numpy())
+
+y_true = np.array(y_true).astype(int)
+y_pred = np.argmax(np.array(y_pred_probs), axis=1)
+
+final_bal_acc = balanced_accuracy_score(y_true, y_pred)
+qwk = cohen_kappa_score(y_true, y_pred, weights="quadratic")
+
+print(f"\n Balanced Accuracy FINAL pe Test: {final_bal_acc:.4f}")
+print(f" QWK (Quadratic Weighted Kappa) pe Test: {qwk:.4f}")
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(7, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Predicție')
+plt.ylabel('Realitate')
+plt.title(f'Matrice Confuzie\nBalAcc: {final_bal_acc:.2f} | QWK: {qwk:.2f}')
+plt.show()
+
+# =========================
+# 13) SAVE
+# =========================
+model.save("aptos_densenet_final.keras")
+print(" Model salvat: aptos_densenet_final.keras")
