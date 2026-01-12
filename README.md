@@ -16,3 +16,4 @@ Obiectiv: Clasificarea automată a severității bolii pe o scară de 5 niveluri
 3 - Severe (Sever)
 
 4 - Proliferative DR (Proliferativ)
+
