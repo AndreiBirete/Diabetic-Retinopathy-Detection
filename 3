@@ -1,0 +1,284 @@
+import os
+import shutil
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score, cohen_kappa_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =========================
+# 1) CONFIG
+# =========================
+SEED = 123
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 16
+
+# Modelul tău antrenat pe APTOS
+APTOS_MODEL_PATH = r"aptos_resnet50_final.keras"
+
+# === Messidor-2 paths (MODIFICĂ AICI) ===
+# Varianta A: ai imagini + CSV cu label
+MESSIDOR_IMG_DIR = r"C:\Users\Jessyca\Downloads\archive\messidor-2\messidor-2\preprocess"     # ex: folderul cu .jpg/.png
+MESSIDOR_CSV_PATH = r"C:\Users\Jessyca\Downloads\archive\messidor_data.csv"  # dacă ai CSV; dacă nu, lasă None
+
+# Numele coloanelor din CSV (dacă ai CSV)
+CSV_IMAGE_COL = "id_code"          # ex: "image_id" / "Filename" / "id_code"
+CSV_LABEL_COL = "diagnosis"  # ex: "adjudicated_dr_grade" / "diagnosis" / "grade"
+
+# Varianta B: vrei să construiești foldere train/val/test/0..4
+MESSIDOR_DATA_DIR = r"messidor2_dataset"  # se va crea automat: train/val/test/0..4
+BUILD_MESSIDOR_FOLDERS = True  # pune pe False dacă ai deja folderizat
+
+# Training setup
+WARMUP_EPOCHS = 3
+FINETUNE_EPOCHS = 15
+LR_WARMUP = 1e-4
+LR_FINETUNE = 1e-5
+UNFREEZE_LAST_N = 60  # câte straturi din backbone să deblochezi la fine-tune
+
+# =========================
+# 2) Utils
+# =========================
+tf.keras.utils.set_random_seed(SEED)
+
+def ensure_dirs(root_dir):
+    for split in ["train", "val", "test"]:
+        for c in range(5):
+            os.makedirs(os.path.join(root_dir, split, str(c)), exist_ok=True)
+
+def auto_find_image_path(img_dir, image_id):
+    # încearcă extensii uzuale
+    for ext in [".jpg", ".jpeg", ".png", ".tif", ".tiff", ""]:
+        p = os.path.join(img_dir, str(image_id) + ext)
+        if os.path.exists(p):
+            return p
+    return None
+
+def normalize_label_to_0_4(y):
+    """
+    Messidor-2 uneori e R0-R3 (0..3), alteori ICDR 0..4.
+    - Dacă e 0..4: return direct
+    - Dacă e 0..3: îl lăsăm 0..3 (clasa 4 va lipsi; e ok)
+    """
+    y = int(y)
+    if y < 0: y = 0
+    if y > 4: y = 4
+    return y
+
+# =========================
+# 3) Build Messidor folder structure (opțional)
+# =========================
+def build_messidor_folders_from_csv():
+    if MESSIDOR_CSV_PATH is None:
+        raise ValueError("Ai BUILD_MESSIDOR_FOLDERS=True, dar MESSIDOR_CSV_PATH=None. Pune calea CSV sau setează BUILD_MESSIDOR_FOLDERS=False.")
+
+    print(" Construiesc structura Messidor-2 în foldere (train/val/test/0..4)...")
+    df = pd.read_csv(MESSIDOR_CSV_PATH)
+
+    # coloane check
+    if CSV_IMAGE_COL not in df.columns or CSV_LABEL_COL not in df.columns:
+        raise ValueError(
+            f"CSV-ul nu are coloanele așteptate. Am nevoie de '{CSV_IMAGE_COL}' și '{CSV_LABEL_COL}'. "
+            f"Coloane găsite: {list(df.columns)}"
+        )
+
+    df["label"] = df[CSV_LABEL_COL].apply(normalize_label_to_0_4)
+    df["path"] = df[CSV_IMAGE_COL].apply(lambda x: auto_find_image_path(MESSIDOR_IMG_DIR, x))
+    df = df[df["path"].notnull()].reset_index(drop=True)
+
+    # split stratificat
+    train_df, temp_df = train_test_split(df, test_size=0.2, random_state=SEED, stratify=df["label"])
+    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=SEED, stratify=temp_df["label"])
+
+    ensure_dirs(MESSIDOR_DATA_DIR)
+
+    def copy_split(split_df, split_name):
+        for _, row in split_df.iterrows():
+            label = str(int(row["label"]))
+            src = row["path"]
+            dst = os.path.join(MESSIDOR_DATA_DIR, split_name, label, os.path.basename(src))
+            if not os.path.exists(dst):
+                shutil.copy2(src, dst)
+
+    copy_split(train_df, "train")
+    copy_split(val_df, "val")
+    copy_split(test_df, "test")
+
+    print(" Messidor-2 folderizat în:", os.path.abspath(MESSIDOR_DATA_DIR))
+    print("   train:", len(train_df), "val:", len(val_df), "test:", len(test_df))
+
+# dacă e nevoie, construim
+if BUILD_MESSIDOR_FOLDERS:
+    ensure_dirs(MESSIDOR_DATA_DIR)
+    has_files = False
+    for _, _, files in os.walk(os.path.join(MESSIDOR_DATA_DIR, "train")):
+        if files:
+            has_files = True
+            break
+    if not has_files:
+        build_messidor_folders_from_csv()
+    else:
+        print(" Messidor-2 pare deja folderizat. Sar peste rebuild.")
+
+# =========================
+# 4) Load Messidor datasets
+# =========================
+print(f" Se încarcă Messidor-2 din: {MESSIDOR_DATA_DIR}")
+
+train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(MESSIDOR_DATA_DIR, "train"),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="int",
+    shuffle=True,
+    seed=SEED
+)
+
+val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(MESSIDOR_DATA_DIR, "val"),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="int",
+    shuffle=False
+)
+
+test_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    os.path.join(MESSIDOR_DATA_DIR, "test"),
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="int",
+    shuffle=False
+)
+
+class_names = train_ds.class_names
+print("Clase detectate:", class_names)
+
+# =========================
+# 5) Class weights (ca în codul tău)
+# =========================
+y_train_all = np.array([int(y.numpy()) for _, y in train_ds.unbatch()])
+weights = class_weight.compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(y_train_all),
+    y=y_train_all
+)
+class_weights = {int(c): float(w) for c, w in zip(np.unique(y_train_all), weights)}
+print(" Class weights:", class_weights)
+
+# =========================
+# 6) Preprocess pt ResNet50 (+ augment doar pe train)
+# =========================
+AUTOTUNE = tf.data.AUTOTUNE
+
+aug = keras.Sequential([
+    keras.layers.RandomFlip("horizontal"),
+    keras.layers.RandomRotation(0.05),
+    keras.layers.RandomZoom(0.1),
+], name="aug")
+
+def resnet_preprocess(x, y, training=False):
+    x = tf.cast(x, tf.float32)
+    if training:
+        x = aug(x, training=True)
+    x = preprocess_input(x)  # IMPORTANT pt ResNet50
+    return x, y
+
+train_ds_pp = train_ds.map(lambda x, y: resnet_preprocess(x, y, training=True), num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
+val_ds_pp   = val_ds.map(lambda x, y: resnet_preprocess(x, y, training=False), num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
+test_ds_pp  = test_ds.map(lambda x, y: resnet_preprocess(x, y, training=False), num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
+
+# =========================
+# 7) Load model APTOS + Fine-tune
+# =========================
+print("\n Încarc modelul APTOS:", APTOS_MODEL_PATH)
+model = keras.models.load_model(APTOS_MODEL_PATH)
+
+# WARMUP pe Messidor (head-ul se adaptează)
+print("\n>>> WARMUP pe Messidor-2 (backbone înghețat)")
+model.compile(
+    optimizer=keras.optimizers.Adam(LR_WARMUP),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+early_stop = keras.callbacks.EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True)
+
+history_warmup = model.fit(
+    train_ds_pp,
+    validation_data=val_ds_pp,
+    epochs=WARMUP_EPOCHS,
+    class_weight=class_weights,
+    callbacks=[early_stop]
+)
+
+# FINETUNE: deblocăm ultimele straturi din backbone ResNet
+print("\n>>> FINETUNE (unfreeze ultimele straturi din ResNet)")
+# cautăm backbone-ul: de regulă e un layer Model numit "resnet50"
+backbone = None
+for layer in model.layers:
+    if isinstance(layer, keras.Model) and "resnet" in layer.name.lower():
+        backbone = layer
+        break
+
+if backbone is None:
+    # fallback: cel mai mare sub-model din model.layers
+    backbone = max([l for l in model.layers if isinstance(l, keras.Model)], key=lambda m: len(m.layers))
+
+backbone.trainable = True
+for l in backbone.layers[:-UNFREEZE_LAST_N]:
+    l.trainable = False
+
+model.compile(
+    optimizer=keras.optimizers.Adam(LR_FINETUNE),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+history_ft = model.fit(
+    train_ds_pp,
+    validation_data=val_ds_pp,
+    epochs=FINETUNE_EPOCHS,
+    class_weight=class_weights,
+    callbacks=[early_stop]
+)
+
+# =========================
+# 8) Test eval: Balanced Acc + QWK + Conf Matrix
+# =========================
+print("\n>>> EVALUARE pe TEST (Messidor-2)")
+y_true, y_pred = [], []
+
+for imgs, labels in test_ds_pp:
+    probs = model.predict(imgs, verbose=0)
+    y_pred.extend(np.argmax(probs, axis=1))
+    y_true.extend(labels.numpy())
+
+y_true = np.array(y_true).astype(int)
+y_pred = np.array(y_pred).astype(int)
+
+bal_acc = balanced_accuracy_score(y_true, y_pred)
+qwk = cohen_kappa_score(y_true, y_pred, weights="quadratic")
+
+print(f" Balanced Accuracy (Messidor-2): {bal_acc:.4f}")
+print(f" QWK (Messidor-2): {qwk:.4f}")
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(7,6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=class_names, yticklabels=class_names)
+plt.title(f"Messidor-2 Confusion Matrix\nBalAcc={bal_acc:.2f} | QWK={qwk:.2f}")
+plt.xlabel("Predicție")
+plt.ylabel("Realitate")
+plt.show()
+
+# =========================
+# 9) Save
+# =========================
+OUT_PATH = "messidor2_finetuned_from_aptos.keras"
+model.save(OUT_PATH)
+print(" Model salvat:", OUT_PATH)
